@@ -97,6 +97,9 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			sendf("fwmark=%d", device.net.fwmark)
 		}
 
+		// Add SCION status information
+		device.writeScionUAPIStatus(buf)
+
 		for _, peer := range device.peers.keyMap {
 			// Serialize peer state.
 			peer.handshake.mutex.RLock()
@@ -124,6 +127,9 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 				sendf("allowed_ip=%s", prefix.String())
 				return true
 			})
+
+			// Add SCION peer status
+			peer.writeScionPeerStatus(buf)
 		}
 	}()
 
@@ -241,6 +247,10 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		device.RemoveAllPeers()
 
 	default:
+		// Check if this is a SCION-specific command
+		if strings.HasPrefix(key, "scion_") {
+			return device.handleScionUAPISet(key, value)
+		}
 		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI device key: %v", key)
 	}
 
@@ -397,7 +407,22 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 			return ipcErrorf(ipc.IpcErrorInvalid, "invalid protocol version: %v", value)
 		}
 
+	case "scion_endpoint":
+		device.log.Verbosef("%v - UAPI: Setting SCION endpoint", peer.Peer)
+		if peer.dummy {
+			return nil
+		}
+		return peer.setScionPeerEndpoint(value)
+
 	default:
+		// Check if this is a SCION-specific peer command
+		if strings.HasPrefix(key, "scion_") {
+			if peer.dummy {
+				return nil
+			}
+			// Handle other SCION peer commands here
+			return ipcErrorf(ipc.IpcErrorInvalid, "unsupported SCION peer key: %v", key)
+		}
 		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI peer key: %v", key)
 	}
 

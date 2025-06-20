@@ -22,6 +22,13 @@ When an interface is running, you may use [`wg(8)`](https://git.zx2c4.com/wiregu
 
 To run with more logging you may set the environment variable `LOG_LEVEL=debug`.
 
+## SCION Networking Support
+
+This enhanced version of wireguard-go includes support for [SCION](https://docs.scion.org/) networking, enabling WireGuard tunnels to operate over SCION paths with automatic fallback to regular IP.
+
+For detailed usage examples, setup scripts, and troubleshooting, see:
+- [`SCION_USAGE.md`](SCION_USAGE.md) - Complete SCION documentation
+
 ## Platforms
 
 ### Linux
