@@ -17,7 +17,7 @@ generate-version-and-build:
 	@$(MAKE) wireguard-go
 
 wireguard-go: $(wildcard *.go) $(wildcard */*.go)
-	go build -v -o "$@"
+	CGO_ENABLED=0 go build -v -o "$@"
 
 install: wireguard-go
 	@install -v -d "$(DESTDIR)$(BINDIR)" && install -v -m 0755 "$<" "$(DESTDIR)$(BINDIR)/wireguard-go"
