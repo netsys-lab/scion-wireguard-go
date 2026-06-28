@@ -20,7 +20,7 @@ Before launching `wireguard-go`, set:
 * `USE_SCION=1`: Enables SCION support
 * `USE_BATCH=1`: Enables batch mode for Linux and Android (default: `0`)
 * `SCION_LOCAL_IA`: Your local SCION ISD-AS (e.g., `1-ffaa:0:1`); optional if `sciond` provides it
-* `SCION_DAEMON_ADDR`: SCION daemon address; optional (default: `127.0.0.1:30255`)
+* `SCION_DAEMON_ADDRESS`: SCION daemon address; optional (default: `127.0.0.1:30255`)
 
 ---
 
