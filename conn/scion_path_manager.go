@@ -19,6 +19,7 @@ import (
 
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
+	"github.com/scionproto/scion/pkg/daemon/types" // Add this line
 	"github.com/scionproto/scion/pkg/snet"
 )
 
@@ -214,7 +215,7 @@ func (pm *PathManager) refreshOne(dest addr.IA) error {
 	ctx, cancel := context.WithTimeout(pm.ctx, 3*time.Second)
 	defer cancel()
 
-	paths, err := pm.d.Paths(ctx, dest, pm.localIA, daemon.PathReqFlags{Refresh: true})
+	paths, err := pm.d.Paths(ctx, dest, pm.localIA, types.PathReqFlags{Refresh: true})
 	if err != nil {
 		pm.mu.Lock()
 		if entry := pm.cache[dest]; entry != nil {
@@ -261,11 +262,11 @@ func (pm *PathManager) refreshOne(dest addr.IA) error {
 		entry.SelectedIndex >= 0 && entry.SelectedIndex < len(entry.Paths) {
 
 		oldPath := entry.Paths[entry.SelectedIndex]
-		oldFingerprint := snet.Fingerprint(oldPath).String()
+		oldFingerprint := snet.Fingerprint(oldPath.Metadata().Interfaces).String()
 
 		// Find the same path in the new set
 		for i, newPath := range paths {
-			if snet.Fingerprint(newPath).String() == oldFingerprint {
+			if snet.Fingerprint(newPath.Metadata().Interfaces).String() == oldFingerprint {
 				// Found the same path, move it to the front and preserve selection
 				if i != 0 {
 					// Move the path and its corresponding rank to position 0
@@ -485,7 +486,7 @@ func (pm *PathManager) GetPathsJSON(iaStr string) (string, error) {
 
 			details := PathDetails{
 				Index:       i,
-				Fingerprint: snet.Fingerprint(path).String(),
+				Fingerprint: snet.Fingerprint(path.Metadata().Interfaces).String(),
 				MTU:         meta.MTU,
 				Latency:     latencies,
 				Bandwidth:   meta.Bandwidth,
