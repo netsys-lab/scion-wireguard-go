@@ -190,6 +190,7 @@ func (s *ScionNetBind) initSCION() error {
 	// Initialize SCION network with proper topology
 	s.scionNetwork = &snet.SCIONNetwork{
 		Topology: snet.Topology{
+			LocalIA: s.config.LocalIA,
 			PortRange: snet.TopologyPortRange{
 				Start: start,
 				End:   end,
