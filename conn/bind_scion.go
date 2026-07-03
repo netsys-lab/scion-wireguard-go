@@ -182,9 +182,20 @@ func (s *ScionNetBind) initSCION() error {
 		s.config.LocalIA = localIA
 	}
 
+	start, end, err := s.daemonConn.PortRange(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get port ranges from daemon: %w", err)
+	}
+
 	// Initialize SCION network with proper topology
 	s.scionNetwork = &snet.SCIONNetwork{
-		Topology:    s.daemonConn,
+		Topology: snet.Topology{
+			LocalIA: s.config.LocalIA,
+			PortRange: snet.TopologyPortRange{
+				Start: start,
+				End:   end,
+			},
+		},
 		ReplyPather: snet.DefaultReplyPather{},
 		Metrics:     snet.SCIONNetworkMetrics{},
 	}
@@ -220,10 +231,8 @@ func (s *ScionNetBind) updateCachedConnData() {
 }
 
 func (s *ScionNetBind) getUDPConn(localAddr *net.UDPAddr, port uint16) (*net.UDPConn, error) {
-	start, end, err := s.scionNetwork.Topology.PortRange(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("failed to get port range: %w", err)
-	}
+	start := s.scionNetwork.Topology.PortRange.Start
+	end := s.scionNetwork.Topology.PortRange.End
 
 	network := "udp4"
 	if localAddr.IP.To4() == nil {
