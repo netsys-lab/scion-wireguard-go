@@ -13,7 +13,9 @@ import (
 
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/private/common"
+	"github.com/scionproto/scion/pkg/slayers"
 	"github.com/scionproto/scion/pkg/snet"
+	snetpath "github.com/scionproto/scion/pkg/snet/path"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -117,7 +119,7 @@ func NewScionBatchConnWithConfig(
 		topology:    topology,
 		pathManager: pathManager,
 		logger:      logger,
-		replyPather: snet.DefaultReplyPather{},
+		replyPather: snetpath.NewHummReplyPather(),
 		batchSize:   1,
 	}
 
@@ -464,7 +466,23 @@ func (s *ScionBatchConn) createEndpoint(scionPkt *snet.Packet, udp *snet.UDPPayl
 		return false
 	}
 
-	replyPath, err := s.replyPather.ReplyPath(rpath)
+	var replyPath snet.DataplanePath
+	var err error
+	if statefulRP, isStateful := s.replyPather.(snet.StatefulReplyPather); isStateful {
+		sourceID := snet.SourceIdentifier{
+			IA:   scionPkt.Source.IA,
+			IP:   scionPkt.Source.Host.IP(),
+			Port: udp.SrcPort,
+		}
+		if serr := statefulRP.SetState(sourceID, *scionPkt); serr != nil {
+			s.logger.Verbosef("Failed to set reply pather state: %v", serr)
+			replyPath, err = s.replyPather.ReplyPath(rpath)
+		} else {
+			replyPath, err = statefulRP.ReplyPathTo(sourceID, rpath)
+		}
+	} else {
+		replyPath, err = s.replyPather.ReplyPath(rpath)
+	}
 	if err != nil {
 		s.logger.Verbosef("Failed to create reply path: %v", err)
 		return false
@@ -545,7 +563,13 @@ func (s *ScionBatchConn) WriteBatch(
 	ua := s.getUDPAddr()
 	defer s.putUDPAddr(ua)
 
-	sbufs, err := s.prepareSCIONPackets(scionPkts, scionEp, bufs, ua, ipv4PC != nil)
+	var fwdRes *snetpath.Reservation
+	var revExtn *slayers.EndToEndExtn
+	if s.pathManager != nil {
+		fwdRes, revExtn, _ = s.pathManager.GetReservations(scionEp.scionAddr.IA)
+	}
+
+	sbufs, err := s.prepareSCIONPackets(scionPkts, scionEp, bufs, ua, ipv4PC != nil, fwdRes, revExtn)
 	if err != nil {
 		return err
 	}
@@ -559,6 +583,8 @@ func (s *ScionBatchConn) prepareSCIONPackets(
 	bufs [][]byte,
 	ua *net.UDPAddr,
 	isIPv4 bool,
+	fwdRes *snetpath.Reservation,
+	revExtn *slayers.EndToEndExtn,
 ) ([][]byte, error) {
 	destination := snet.SCIONAddress{
 		IA:   scionEp.scionAddr.IA,
@@ -569,7 +595,13 @@ func (s *ScionBatchConn) prepareSCIONPackets(
 		Host: addr.HostIP(netip.MustParseAddr(s.localAddr.IP.String())),
 	}
 
-	path := scionEp.scionAddr.Path
+	var path snet.DataplanePath
+	if fwdRes != nil {
+		path = fwdRes
+	} else {
+		path = scionEp.scionAddr.Path
+	}
+
 	srcPort := uint16(s.localAddr.Port)
 	dstPort := uint16(scionEp.scionAddr.Host.Port)
 
@@ -588,12 +620,12 @@ func (s *ScionBatchConn) prepareSCIONPackets(
 	}
 
 	if s.fastSerialize {
-		if err := SerializeBatch((*scionPkts)[:len(bufs)], sbufs); err != nil {
+		if err := SerializeBatch((*scionPkts)[:len(bufs)], sbufs, fwdRes, revExtn); err != nil {
 			return nil, fmt.Errorf("failed to serialize SCION packets: %w", err)
 		}
 	} else {
 		for i := range bufs {
-			if err := (*scionPkts)[i].Serialize(); err != nil {
+			if err := Serialize(&(*scionPkts)[i], fwdRes, revExtn); err != nil {
 				return nil, fmt.Errorf("failed to serialize SCION packet %d: %w", i, err)
 			}
 			sbufs[i] = (*scionPkts)[i].Bytes

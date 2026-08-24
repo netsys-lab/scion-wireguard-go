@@ -17,6 +17,7 @@ import (
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
 	"github.com/scionproto/scion/pkg/snet"
+	snetpath "github.com/scionproto/scion/pkg/snet/path"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -69,12 +70,17 @@ type connData struct {
 
 // ScionConfig holds SCION-specific configuration
 type ScionConfig struct {
-	DaemonAddr string
-	LocalAS    addr.AS
-	PathPolicy PathPolicy
-	LocalIA    addr.IA
-	LocalIP    net.IP
-	LocalPort  uint16
+	DaemonAddr     string
+	LocalAS        addr.AS
+	PathPolicy     PathPolicy
+	LocalIA        addr.IA
+	LocalIP        net.IP
+	LocalPort      uint16
+	Reserve        bool
+	Bidirectional  bool
+	BandwidthKBps  uint16
+	DurationSec    uint16
+	RenewBeforeSec uint16
 }
 
 type PathPolicy int
@@ -196,7 +202,7 @@ func (s *ScionNetBind) initSCION() error {
 				End:   end,
 			},
 		},
-		ReplyPather: snet.DefaultReplyPather{},
+		ReplyPather: snetpath.NewHummReplyPather(),
 		Metrics:     snet.SCIONNetworkMetrics{},
 	}
 
@@ -206,6 +212,12 @@ func (s *ScionNetBind) initSCION() error {
 		s.config.PathPolicy, // selection policy
 		s.logger,
 		WithRefreshInterval(5*time.Minute),
+		WithLocalIP(s.config.LocalIP),
+		WithReserve(s.config.Reserve),
+		WithBidirectional(s.config.Bidirectional),
+		WithBandwidth(s.config.BandwidthKBps),
+		WithDuration(s.config.DurationSec),
+		WithRenewBefore(s.config.RenewBeforeSec),
 	)
 	s.logger.Verbosef("SCION network initialized with IA %s", s.config.LocalIA)
 
@@ -455,7 +467,11 @@ func (s *ScionNetBind) Send(bufs [][]byte, ep Endpoint) error {
 	// Update path if path manager is available
 	if connData.pathManager != nil {
 		if p, err := connData.pathManager.GetPath(scionEp.scionAddr.IA); err == nil {
-			scionEp.scionAddr.Path = p.Dataplane()
+			if fwdRes, _, hasRes := connData.pathManager.GetReservations(scionEp.scionAddr.IA); hasRes && fwdRes != nil {
+				scionEp.scionAddr.Path = fwdRes
+			} else {
+				scionEp.scionAddr.Path = p.Dataplane()
+			}
 			scionEp.scionAddr.NextHop = p.UnderlayNextHop()
 		}
 	}
@@ -505,7 +521,11 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 		if pathManager != nil {
 			pathManager.RegisterEndpoint(scionAddr.IA)
 			if p, err := pathManager.GetPath(scionAddr.IA); err == nil {
-				scionAddr.Path = p.Dataplane()
+				if fwdRes, _, hasRes := pathManager.GetReservations(scionAddr.IA); hasRes && fwdRes != nil {
+					scionAddr.Path = fwdRes
+				} else {
+					scionAddr.Path = p.Dataplane()
+				}
 				scionAddr.NextHop = p.UnderlayNextHop()
 
 				// Use optimized IP address conversion

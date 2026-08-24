@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/scionproto/scion/pkg/addr"
@@ -75,6 +76,52 @@ func LoadScionConfigFromEnv() (*ScionConfig, error) {
 
 	config.LocalIP = localIP
 	config.LocalIA = ia
+
+	// Parse Hummingbird configuration from environment
+	config.Reserve = os.Getenv("USE_RESERVATION") == "1" || os.Getenv("USE_HUMMINGBIRD") == "1"
+
+	config.Bidirectional = true
+	if bidi := os.Getenv("HUMMINGBIRD_BIDIRECTIONAL"); bidi != "" {
+		config.Bidirectional = bidi == "1" || strings.ToLower(bidi) == "true"
+	}
+
+	if bw := os.Getenv("RESERVATION_BW"); bw != "" {
+		if val, err := strconv.ParseUint(bw, 10, 16); err == nil {
+			config.BandwidthKBps = uint16(val)
+		}
+	}
+
+	if dur := os.Getenv("HUMMINGBIRD_DURATION"); dur != "" {
+		if val, err := strconv.ParseUint(dur, 10, 16); err == nil {
+			config.DurationSec = uint16(val)
+		}
+	} else if dur := os.Getenv("RESERVATION_DURATION"); dur != "" {
+		if val, err := strconv.ParseUint(dur, 10, 16); err == nil {
+			config.DurationSec = uint16(val)
+		}
+	}
+
+	if rb := os.Getenv("HUMMINGBIRD_RENEW_BEFORE"); rb != "" {
+		if val, err := strconv.ParseUint(rb, 10, 16); err == nil {
+			config.RenewBeforeSec = uint16(val)
+		}
+	} else if rb := os.Getenv("RESERVATION_RENEW_BEFORE"); rb != "" {
+		if val, err := strconv.ParseUint(rb, 10, 16); err == nil {
+			config.RenewBeforeSec = uint16(val)
+		}
+	}
+
+	// Apply Hummingbird defaults
+	if config.BandwidthKBps == 0 {
+		config.BandwidthKBps = 100
+	}
+	if config.DurationSec == 0 {
+		config.DurationSec = 9
+	}
+	if config.RenewBeforeSec == 0 {
+		config.RenewBeforeSec = 2
+	}
+
 	return config, nil
 }
 
@@ -100,8 +147,13 @@ func (c *ScionConfig) String() string {
 // DefaultScionConfig returns a default SCION configuration
 func DefaultScionConfig() *ScionConfig {
 	return &ScionConfig{
-		DaemonAddr: DefaultSCIONDaemonAddr,
-		PathPolicy: PathPolicyFirst,
+		DaemonAddr:     DefaultSCIONDaemonAddr,
+		PathPolicy:     PathPolicyFirst,
+		Reserve:        false,
+		Bidirectional:  true,
+		BandwidthKBps:  100,
+		DurationSec:    9,
+		RenewBeforeSec: 2,
 	}
 }
 
