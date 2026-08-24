@@ -20,7 +20,11 @@ import (
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
 	"github.com/scionproto/scion/pkg/daemon/types" // Add this line
+	"github.com/scionproto/scion/pkg/hummingbird"
+	"github.com/scionproto/scion/pkg/hummingbird/redemption"
+	"github.com/scionproto/scion/pkg/slayers"
 	"github.com/scionproto/scion/pkg/snet"
+	snetpath "github.com/scionproto/scion/pkg/snet/path"
 )
 
 // refreshInterval is the default cadence at which the manager re‑resolves
@@ -30,12 +34,16 @@ const refreshInterval = 5 * time.Minute
 
 // PathCacheEntry represents a cache entry for paths to a specific IA
 type PathCacheEntry struct {
-	Paths          []snet.Path // All available paths
-	SelectedIndex  int         // Index of currently selected path
-	IsManualSelect bool        // Whether path was manually selected
-	LastRefresh    time.Time   // When paths were last refreshed
-	PathRanks      []PathRank  // Ranking information for each path
-	LastError      error       // Last error encountered during refresh
+	Paths              []snet.Path           // All available paths
+	SelectedIndex      int                   // Index of currently selected path
+	IsManualSelect     bool                  // Whether path was manually selected
+	LastRefresh        time.Time             // When paths were last refreshed
+	PathRanks          []PathRank            // Ranking information for each path
+	LastError          error                 // Last error encountered during refresh
+	ForwardReservation *snetpath.Reservation // Active forward Hummingbird reservation
+	ReverseExtn        *slayers.EndToEndExtn // Active reverse Hummingbird reservation extension
+	CancelRenewal      context.CancelFunc    // Cancel routine for renewal loop
+	LastReverseExtn    *slayers.EndToEndExtn // Last sent reverse extension to avoid redundant sends
 }
 
 // PathRank contains ranking information for a single path
@@ -76,6 +84,14 @@ type PathManager struct {
 
 	refresh    time.Duration
 	httpServer *http.Server // Added for the API server
+
+	// Hummingbird settings
+	reserve        bool
+	bidirectional  bool
+	bandwidthKBps  uint16
+	durationSec    uint16
+	renewBeforeSec uint16
+	localIP        net.IP
 }
 
 // NewPathManager wires up a new path manager.  The background refresh only
@@ -111,6 +127,30 @@ func WithRefreshInterval(d time.Duration) PathManagerOption {
 	return func(pm *PathManager) { pm.refresh = d }
 }
 
+func WithLocalIP(ip net.IP) PathManagerOption {
+	return func(pm *PathManager) { pm.localIP = ip }
+}
+
+func WithReserve(reserve bool) PathManagerOption {
+	return func(pm *PathManager) { pm.reserve = reserve }
+}
+
+func WithBidirectional(bidi bool) PathManagerOption {
+	return func(pm *PathManager) { pm.bidirectional = bidi }
+}
+
+func WithBandwidth(bw uint16) PathManagerOption {
+	return func(pm *PathManager) { pm.bandwidthKBps = bw }
+}
+
+func WithDuration(dur uint16) PathManagerOption {
+	return func(pm *PathManager) { pm.durationSec = dur }
+}
+
+func WithRenewBefore(rb uint16) PathManagerOption {
+	return func(pm *PathManager) { pm.renewBeforeSec = rb }
+}
+
 // Start kicks off the periodic refresh goroutine.  Calling Start multiple
 // times is a no‑op.
 func (pm *PathManager) Start() {
@@ -134,6 +174,15 @@ func (pm *PathManager) loop() {
 // once.
 func (pm *PathManager) Close() {
 	pm.cancel()
+
+	pm.mu.Lock()
+	for _, entry := range pm.cache {
+		if entry != nil && entry.CancelRenewal != nil {
+			entry.CancelRenewal()
+		}
+	}
+	pm.mu.Unlock()
+
 	if pm.httpServer != nil {
 		pm.log.Verbosef("Shutting down PathManager API server...")
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -195,6 +244,21 @@ func (pm *PathManager) GetPath(ia addr.IA) (snet.Path, error) {
 		return nil, fmt.Errorf("no path found for IA %s", ia)
 	}
 	return entry.Paths[entry.SelectedIndex], nil
+}
+
+// GetReservations retrieves the active forward and reverse Hummingbird reservations.
+func (pm *PathManager) GetReservations(ia addr.IA) (*snetpath.Reservation, *slayers.EndToEndExtn, bool) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	entry := pm.cache[ia]
+	if entry == nil || !pm.reserve {
+		return nil, nil, false
+	}
+	if entry.ReverseExtn != entry.LastReverseExtn {
+		entry.LastReverseExtn = entry.ReverseExtn
+		return entry.ForwardReservation, entry.ReverseExtn, true
+	}
+	return entry.ForwardReservation, nil, true
 }
 
 func (pm *PathManager) refreshAll() {
@@ -313,7 +377,137 @@ func (pm *PathManager) refreshOne(dest addr.IA) error {
 	entry.LastRefresh = time.Now()
 	entry.LastError = nil
 
+	if pm.reserve && entry.CancelRenewal == nil && len(paths) > 0 {
+		ctx, cancel := context.WithCancel(pm.ctx)
+		entry.CancelRenewal = cancel
+		go pm.reservationRenewalLoop(ctx, dest)
+	}
+
 	return nil
+}
+
+func (pm *PathManager) reservationRenewalLoop(ctx context.Context, dest addr.IA) {
+	defer func() {
+		if r := recover(); r != nil {
+			pm.log.Errorf("reservation renewer for %s panicked: %v", dest, r)
+		}
+	}()
+
+	for {
+		pm.mu.RLock()
+		entry := pm.cache[dest]
+		pm.mu.RUnlock()
+
+		if entry == nil {
+			return
+		}
+
+		pm.mu.RLock()
+		forwardRes := entry.ForwardReservation
+		pm.mu.RUnlock()
+
+		if forwardRes != nil {
+			wait := reservationRenewalDelay(forwardRes, pm.renewBeforeSec, pm.durationSec)
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+
+		// When "all bits used, no free color found" issue is fixed, this is obsolete
+		switchAt := time.Now()
+		pm.mu.RLock()
+		if entry.ForwardReservation != nil {
+			if exp, ok := reservationExpirationTime(entry.ForwardReservation); ok {
+				switchAt = exp
+			}
+		}
+		pm.mu.RUnlock()
+
+		fwd, rev, err := pm.requestOneShotReservation(ctx, dest)
+		if err != nil {
+			pm.log.Errorf("Hummingbird reservation renewal for %s failed: %v", dest, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+
+		// When "all bits used, no free color found" issue is fixed, this code fragment is obsolete
+		if wait := time.Until(switchAt); wait > 0 {
+			switchTimer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				switchTimer.Stop()
+				return
+			case <-switchTimer.C:
+			}
+		}
+
+		pm.mu.Lock()
+		entry = pm.cache[dest]
+		if entry != nil {
+			entry.ForwardReservation = fwd
+			entry.ReverseExtn = rev
+		}
+		pm.mu.Unlock()
+	}
+}
+
+func (pm *PathManager) requestOneShotReservation(ctx context.Context, dest addr.IA) (*snetpath.Reservation, *slayers.EndToEndExtn, error) {
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
+	paths, err := pm.d.Paths(ctx, dest, pm.localIA, types.PathReqFlags{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("load paths: %w", err)
+	}
+	if len(paths) == 0 {
+		return nil, nil, fmt.Errorf("no paths to %s", dest)
+	}
+
+	var existingFwd *snetpath.Reservation
+	pm.mu.RLock()
+	entry := pm.cache[dest]
+	selectedIndex := 0
+	if entry != nil {
+		if entry.SelectedIndex >= 0 && entry.SelectedIndex < len(paths) {
+			selectedIndex = entry.SelectedIndex
+		}
+		existingFwd = entry.ForwardReservation
+	}
+	pm.mu.RUnlock()
+
+	path := paths[selectedIndex]
+
+	startTime := renewalRequestStartTimeUnix(existingFwd)
+
+	request := hummingbird.RedemptionRequestNoHop{
+		StartTime: startTime,
+		Bw:        pm.bandwidthKBps,
+		Duration:  pm.durationSec,
+	}
+
+	var reverseBw uint16
+	if pm.bidirectional {
+		reverseBw = pm.bandwidthKBps
+	}
+
+	fwd, err := redemption.OneShotReservation(ctx, pm.d, pm.localIP, path, request, reverseBw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reservation negotiation: %w", err)
+	}
+
+	rev, err := fwd.EndToEndExtn()
+	if err != nil {
+		return nil, nil, fmt.Errorf("reverse reservation extension: %w", err)
+	}
+	return fwd, rev, nil
 }
 
 // SetPolicy sets the path selection policy

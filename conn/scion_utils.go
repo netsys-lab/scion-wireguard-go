@@ -7,9 +7,11 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/gopacket/gopacket"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/slayers"
 	"github.com/scionproto/scion/pkg/snet"
+	snetpath "github.com/scionproto/scion/pkg/snet/path"
 )
 
 const (
@@ -105,7 +107,7 @@ func computeFlowID(p *snet.Packet) uint32 {
 //
 // Note: Checksum calculation is disabled for performance. If checksums are
 // required, they must be computed separately.
-func Serialize(p *snet.Packet) error {
+func Serialize(p *snet.Packet, fwdRes *snetpath.Reservation, revExtn *slayers.EndToEndExtn) error {
 	// Validate packet structure
 	if err := validatePacketForSerialization(p, -1); err != nil {
 		return err
@@ -122,7 +124,20 @@ func Serialize(p *snet.Packet) error {
 	scion.FlowID = computeFlowID(p)
 	scion.DstIA = p.Destination.IA
 	scion.SrcIA = p.Source.IA
-	scion.NextHdr = slayers.L4UDP
+
+	var e2eLen int
+	var e2eBytes []byte
+	if revExtn != nil {
+		serializeBuf := gopacket.NewSerializeBuffer()
+		if err := revExtn.SerializeTo(serializeBuf, gopacket.SerializeOptions{FixLengths: true}); err != nil {
+			return fmt.Errorf("serializing E2E extension: %w", err)
+		}
+		e2eBytes = serializeBuf.Bytes()
+		e2eLen = len(e2eBytes)
+		scion.NextHdr = slayers.End2EndClass
+	} else {
+		scion.NextHdr = slayers.L4UDP
+	}
 
 	if err := scion.SetDstAddr(p.Destination.Host); err != nil {
 		return fmt.Errorf("setting destination address: %w", err)
@@ -130,15 +145,25 @@ func Serialize(p *snet.Packet) error {
 	if err := scion.SetSrcAddr(p.Source.Host); err != nil {
 		return fmt.Errorf("setting source address: %w", err)
 	}
-	if err := p.Path.SetPath(&scion); err != nil {
-		return fmt.Errorf("setting path: %w", err)
-	}
 
 	// ---------- Length bookkeeping ----------
 	udpLen := UDPHeaderLen + len(udpPayload.Payload)
-	scion.PayloadLen = uint16(udpLen) // no extensions
+	scion.PayloadLen = uint16(e2eLen + udpLen)
+
+	if fwdRes != nil && fwdRes.Dec != nil {
+		scion.Path = fwdRes.Dec
+		scion.PathType = fwdRes.Dec.Type()
+		if err := fwdRes.SetPath(&scion); err != nil {
+			return fmt.Errorf("setting forward reservation path: %w", err)
+		}
+	} else {
+		if err := p.Path.SetPath(&scion); err != nil {
+			return fmt.Errorf("setting path: %w", err)
+		}
+	}
+
 	scHdrLen := slayers.CmnHdrLen + scion.AddrHdrLen() + scion.Path.Len()
-	totalLen := scHdrLen + udpLen
+	totalLen := scHdrLen + e2eLen + udpLen
 
 	// Ensure buffer capacity
 	if err := ensureCapacity(p.Bytes, totalLen, "packet serialization"); err != nil {
@@ -178,6 +203,12 @@ func Serialize(p *snet.Packet) error {
 		return fmt.Errorf("serializing path: %w", err)
 	}
 	off += scion.Path.Len() // now off == scHdrLen
+
+	// ---------- E2E Extension header ----------
+	if revExtn != nil {
+		copy(buf[off:off+e2eLen], e2eBytes)
+		off += e2eLen
+	}
 
 	// ---------- UDP header ----------
 	binary.BigEndian.PutUint16(buf[off+0:], udpPayload.SrcPort)
@@ -220,7 +251,7 @@ func Serialize(p *snet.Packet) error {
 //
 // Note: If any packet fails validation, the function returns immediately
 // without modifying any packets (atomic operation).
-func SerializeBatch(pkts []snet.Packet, bufs [][]byte) error {
+func SerializeBatch(pkts []snet.Packet, bufs [][]byte, fwdRes *snetpath.Reservation, revExtn *slayers.EndToEndExtn) error {
 	if len(pkts) == 0 {
 		return nil
 	}
@@ -237,33 +268,43 @@ func SerializeBatch(pkts []snet.Packet, bufs [][]byte) error {
 
 	// 1. Serialize the first packet completely to serve as a template
 	firstPkt := &pkts[0]
-	if err := Serialize(firstPkt); err != nil {
+	if err := Serialize(firstPkt, fwdRes, revExtn); err != nil {
 		return fmt.Errorf("failed to serialize template packet: %w", err)
 	}
 	bufs[0] = firstPkt.Bytes
 
-	// Determine SCION header length from the first serialized packet
-	firstUdpPayload := firstPkt.Payload.(snet.UDPPayload) // Safe after validation
-	firstUdpLen := UDPHeaderLen + len(firstUdpPayload.Payload)
-	scHdrLen := len(firstPkt.Bytes) - firstUdpLen
-
-	// Sanity check the calculated header length
-	if scHdrLen <= SCIONCommonHeaderLen || scHdrLen >= len(firstPkt.Bytes) {
-		return fmt.Errorf("invalid SCION header length calculated: %d (total: %d, UDP: %d)",
-			scHdrLen, len(firstPkt.Bytes), firstUdpLen)
+	var e2eLen int
+	if revExtn != nil {
+		serializeBuf := gopacket.NewSerializeBuffer()
+		_ = revExtn.SerializeTo(serializeBuf, gopacket.SerializeOptions{FixLengths: true})
+		e2eLen = len(serializeBuf.Bytes())
 	}
 
-	// Cache the SCION header and UDP header templates from the first packet
-	scionHeaderTemplate := firstPkt.Bytes[0:scHdrLen]
-	udpHeaderTemplate := firstPkt.Bytes[scHdrLen : scHdrLen+UDPHeaderLen]
+	// Determine SCION header length from the first serialized packet
+	firstUdpPayload := firstPkt.Payload.(snet.UDPPayload)
+	firstUdpLen := UDPHeaderLen + len(firstUdpPayload.Payload)
+	scHdrLen := len(firstPkt.Bytes) - firstUdpLen - e2eLen
 
-	// 2. Serialize subsequent packets using the header template
+	var scionProto slayers.SCION
+	scionProto.DstIA = firstPkt.PacketInfo.Destination.IA
+	scionProto.SrcIA = firstPkt.PacketInfo.Source.IA
+	_ = scionProto.SetDstAddr(firstPkt.PacketInfo.Destination.Host)
+	_ = scionProto.SetSrcAddr(firstPkt.PacketInfo.Source.Host)
+	addrHdrLen := scionProto.AddrHdrLen()
+	pathLen := scHdrLen - slayers.CmnHdrLen - addrHdrLen
+
+	prePathLen := slayers.CmnHdrLen + addrHdrLen
+	prePathTemplate := firstPkt.Bytes[0:prePathLen]
+	postPathLen := e2eLen + UDPHeaderLen
+	postPathTemplate := firstPkt.Bytes[scHdrLen : scHdrLen+postPathLen]
+
+	// 2. Serialize subsequent packets in the batch
 	for i := 1; i < len(pkts); i++ {
-		p := &pkts[i] // Work with a pointer to modify pkts[i].Bytes
+		p := &pkts[i]
 
-		currentUdpPayload := p.Payload.(snet.UDPPayload) // Safe after validation
+		currentUdpPayload := p.Payload.(snet.UDPPayload)
 		currentUdpLen := UDPHeaderLen + len(currentUdpPayload.Payload)
-		totalLen := scHdrLen + currentUdpLen
+		totalLen := scHdrLen + e2eLen + currentUdpLen
 
 		// Ensure buffer capacity
 		if err := ensureCapacity(p.Bytes, totalLen, fmt.Sprintf("packet %d", i)); err != nil {
@@ -271,28 +312,52 @@ func SerializeBatch(pkts []snet.Packet, bufs [][]byte) error {
 		}
 		p.Bytes = p.Bytes[:totalLen]
 
-		// Copy the SCION header template
-		copy(p.Bytes[0:scHdrLen], scionHeaderTemplate)
+		// Copy static templates
+		copy(p.Bytes[0:prePathLen], prePathTemplate)
+		copy(p.Bytes[scHdrLen:scHdrLen+postPathLen], postPathTemplate)
 
 		// Update SCION common header's PayloadLen field
-		binary.BigEndian.PutUint16(p.Bytes[PayloadLenOffset:PayloadLenOffset+2], uint16(currentUdpLen))
+		binary.BigEndian.PutUint16(p.Bytes[PayloadLenOffset:PayloadLenOffset+2], uint16(e2eLen+currentUdpLen))
 
-		// Copy the UDP header template (contains src/dst ports and zeroed checksum)
-		copy(p.Bytes[scHdrLen:scHdrLen+UDPHeaderLen], udpHeaderTemplate)
+		if fwdRes != nil && fwdRes.Dec != nil {
+			var scion slayers.SCION
+			scion.Version = 0
+			scion.FlowID = computeFlowID(p)
+			scion.DstIA = p.PacketInfo.Destination.IA
+			scion.SrcIA = p.PacketInfo.Source.IA
+			scion.PayloadLen = uint16(e2eLen + currentUdpLen)
+			scion.HdrLen = uint8(scHdrLen / 4)
+			if revExtn != nil {
+				scion.NextHdr = slayers.End2EndClass
+			} else {
+				scion.NextHdr = slayers.L4UDP
+			}
+			_ = scion.SetDstAddr(p.PacketInfo.Destination.Host)
+			_ = scion.SetSrcAddr(p.PacketInfo.Source.Host)
+
+			scion.Path = fwdRes.Dec
+			scion.PathType = fwdRes.Dec.Type()
+			if err := fwdRes.SetPath(&scion); err != nil {
+				return fmt.Errorf("failed to set reservation path for packet %d: %w", i, err)
+			}
+
+			if err := scion.Path.SerializeTo(p.Bytes[prePathLen : prePathLen+pathLen]); err != nil {
+				return fmt.Errorf("failed to serialize path for packet %d: %w", i, err)
+			}
+		} else {
+			copy(p.Bytes[prePathLen:prePathLen+pathLen], firstPkt.Bytes[prePathLen:prePathLen+pathLen])
+		}
 
 		// Update UDP header's Length field
-		udpLenOffset := scHdrLen + UDPLengthOffset
-		if currentUdpLen > 0xffff { // Jumbogram case
+		udpLenOffset := scHdrLen + e2eLen + UDPLengthOffset
+		if currentUdpLen > 0xffff {
 			binary.BigEndian.PutUint16(p.Bytes[udpLenOffset:udpLenOffset+2], 0)
 		} else {
 			binary.BigEndian.PutUint16(p.Bytes[udpLenOffset:udpLenOffset+2], uint16(currentUdpLen))
 		}
 
-		// Copy the actual UDP payload for the current packet
-		copy(p.Bytes[scHdrLen+UDPHeaderLen:], currentUdpPayload.Payload)
-
-		// Note: If checksums were being calculated, they would be computed here
-		// based on the new payload content.
+		// Copy actual UDP payload data
+		copy(p.Bytes[scHdrLen+postPathLen:], currentUdpPayload.Payload)
 
 		bufs[i] = p.Bytes
 	}
